@@ -5,7 +5,9 @@ from typing import Any, Dict, Iterable, Optional, Tuple, Sequence
 
 import numpy as np
 import pandas as pd
-from V2.powerball_ticket_generator import TemperatureLotteryGenerator
+import re
+
+from powerball_ticket_generator import TemperatureLotteryGenerator
 
 # -------------------------------------------------
 # Prize constants (single source of truth)
@@ -59,21 +61,16 @@ except Exception:  # pragma: no cover
 def _payout_from_counts(
     white_matches: int,
     red_match: int,
-    multiplier_flag: int,
+    multiplier_flag: int,  # NOW: actual multiplier for this ticket on this draw (1,2,3,4,5,10,...)
     jackpot_value: float,
 ) -> float:
-    """Compute per-ticket payout given match counts.
-
-    Args:
-        white_matches: number of matching white balls (0..5)
-        red_match: 1 if red matches else 0
-        multiplier_flag: 1 if Power Play applied else 0
-        jackpot_value: jackpot value to award for 5+red
-
-    Returns:
-        payout in USD as float.
     """
-    m = 2.0 if multiplier_flag == 1 else 1.0
+    multiplier_flag must be the actual draw multiplier if Power Play was purchased,
+    otherwise 1. Jackpot is never multiplied.
+    """
+    m = float(multiplier_flag)
+    if m < 1.0:
+        m = 1.0
 
     # Jackpot: multiplier does not apply.
     if white_matches == 5 and red_match == 1:
@@ -100,7 +97,7 @@ def _payout_from_counts(
 def _score_kernel_numba(
     ticket_whites: np.ndarray,  # (N, 5) int64
     ticket_reds: np.ndarray,  # (N,) int64
-    multipliers: np.ndarray,  # (N,) int8 (0/1)
+    multipliers: np.ndarray,  # (N,) int16 actual multiplier (1,2,3,4,5,10,...)
     win_whites: np.ndarray,  # (5,) int64
     win_red: int,
     jackpot_value: float,
@@ -133,7 +130,7 @@ def _score_kernel_numba(
 def _score_kernel_numpy(
     ticket_whites: np.ndarray,
     ticket_reds: np.ndarray,
-    multipliers: np.ndarray,  # bool
+    multipliers: np.ndarray,  # int array: 1 for no PP, else draw PP multiplier
     win_whites: np.ndarray,
     win_red: int,
     jackpot_value: float,
@@ -144,7 +141,9 @@ def _score_kernel_numpy(
         axis=(1, 2),
     )
     red_matches = ticket_reds == win_red
-    m = 1.0 + multipliers.astype(np.float64)  # 1.0 or 2.0
+
+    m = multipliers.astype(np.float64)
+    m = np.where(m >= 1.0, m, 1.0)
 
     payouts = np.zeros(ticket_whites.shape[0], dtype=np.float64)
 
@@ -170,6 +169,8 @@ def _score_kernel_numpy(
     payouts[mask] = PRIZE_RED_ONLY * m[mask]
 
     return payouts
+
+
 
 class PowerballBacktester:
     """
@@ -306,6 +307,15 @@ class PowerballBacktester:
             [self._jackpot_value_for_date(str(d)) for d in self._draw_dates],
             dtype=np.float64,
         )
+
+        # --- Power Play multiplier per draw (parsed from draws['power_play']) ---
+        if "power_play" in self.draws.columns:
+            self.draws["power_play_multiplier"] = self.draws["power_play"].apply(self._parse_power_play_value).astype(int)
+        else:
+            self.draws["power_play_multiplier"] = 1
+        
+        self._power_play_mult = self.draws["power_play_multiplier"].to_numpy(dtype=np.int16)
+
 
         # Stored after run()
         self.pnl_table: Optional[pd.DataFrame] = None
@@ -446,31 +456,32 @@ class PowerballBacktester:
 
     def _allocate_ticket_counts(self, budget: int) -> Tuple[int, int]:
         """
-        Given an integer dollar budget, compute (n_multiplier, n_non_multiplier)
-        maximizing multiplier tickets.
-
+        Given an integer dollar budget, compute (n_multiplier, n_non_multiplier).
+    
         Ticket pricing:
           - $2 base ticket
           - $3 ticket with multiplier
-
+    
         Remainder handling:
           - Avoid remainder==1 by converting one $3 into two $2 tickets.
         """
         budget = int(budget)
         if budget < 2:
             return 0, 0
-
+    
+        # If multiplier tickets are disabled, buy only $2 base tickets.
         if not self.use_multiplier:
-            return budget // 2, 0
-
+            return 0, budget // 2
+    
         n_mult = budget // 3
         remainder = budget - 3 * n_mult
         if remainder == 1:
             n_mult -= 1
             remainder += 3
-
+    
         n_no = remainder // 2
         return max(0, n_mult), max(0, n_no)
+
 
     def _generate_batch(
         self,
@@ -508,36 +519,39 @@ class PowerballBacktester:
         return self.generator.generate_ticket_batch(**kwargs)
 
     def _generate_tickets_for_budget(
-        self, budget: int, *, rng: Optional[np.random.Generator] = None
+        self,
+        budget: int,
+        *,
+        draw_power_play: int,
+        rng: Optional[np.random.Generator] = None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
         """Generate tickets for a single draw given an integer budget.
-
+    
         Returns:
           whites: (N,5) int64
           reds: (N,) int64
-          multipliers: (N,) bool
+          multipliers: (N,) int16  -> 1 for no Power Play, else draw's Power Play (2/3/4/5/10)
           costs: (N,) int64 (2 or 3)
           white_temps: (N,) float64 or None
           red_temps: (N,) float64 or None
-
-        Performance note:
-          - If `store_temperatures=False`, tickets are generated without metadata so we do not
-            pay the overhead of sampling/serializing temperature fields.
         """
         n_mult, n_no = self._allocate_ticket_counts(budget)
         n_total = n_mult + n_no
-
+    
         whites = np.empty((n_total, 5), dtype=np.int64)
         reds = np.empty((n_total,), dtype=np.int64)
-        mults = np.empty((n_total,), dtype=bool)
+        mults = np.empty((n_total,), dtype=np.int16)
         costs = np.empty((n_total,), dtype=np.int64)
-
+    
         include_metadata = bool(self.store_temperatures)
         white_temps = np.empty((n_total,), dtype=np.float64) if include_metadata else None
         red_temps = np.empty((n_total,), dtype=np.float64) if include_metadata else None
-
+    
         idx = 0
-
+        draw_pp = int(draw_power_play)
+        if draw_pp < 1:
+            draw_pp = 1
+    
         def _fill(batch: Iterable[Dict[str, Any]], is_mult: bool, cost: int) -> None:
             nonlocal idx
             for t in batch:
@@ -551,13 +565,18 @@ class PowerballBacktester:
                 else:
                     w = (t["white_1"], t["white_2"], t["white_3"], t["white_4"], t["white_5"])
                     r = t["red_ball"]
-
+    
                 whites[idx, :] = (int(w[0]), int(w[1]), int(w[2]), int(w[3]), int(w[4]))
                 reds[idx] = int(r)
-                mults[idx] = bool(is_mult)
+    
+                # KEY CHANGE:
+                # - If Power Play ticket purchased: multiplier is draw_pp (2/3/4/5/10)
+                # - Else: multiplier is 1
+                mults[idx] = draw_pp if is_mult else 1
+    
                 costs[idx] = int(cost)
                 idx += 1
-
+    
         if n_mult > 0:
             batch_mult = self._generate_batch(
                 n_mult,
@@ -567,7 +586,7 @@ class PowerballBacktester:
             _fill(batch_mult, is_mult=True, cost=3)
         else:
             batch_mult = None
-
+    
         if n_no > 0:
             batch_no = self._generate_batch(
                 n_no,
@@ -576,7 +595,7 @@ class PowerballBacktester:
                 existing_tickets=batch_mult,
             )
             _fill(batch_no, is_mult=False, cost=2)
-
+    
         return whites, reds, mults, costs, white_temps, red_temps
 
     def _score_tickets(
@@ -595,7 +614,7 @@ class PowerballBacktester:
             return _score_kernel_numba(
                 whites,
                 reds,
-                mults.astype(np.int8),
+                mults.astype(np.int16),
                 win_whites.astype(np.int64),
                 int(win_red),
                 float(jackpot_value),
@@ -609,6 +628,23 @@ class PowerballBacktester:
             int(win_red),
             float(jackpot_value),
         )
+
+    @staticmethod
+    def _parse_power_play_value(v: Any) -> int:
+        """
+        Parse draw-level Power Play strings like '3X', '10x', ' 4 X ' into an integer multiplier.
+        Returns 1 if missing/unparseable.
+        """
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return 1
+        s = str(v).strip().upper()
+        if s == "" or s in {"NAN", "NONE"}:
+            return 1
+        m = re.search(r"(\d+)", s)
+        if not m:
+            return 1
+        x = int(m.group(1))
+        return x if x >= 1 else 1
 
     # ------------------------------------------------------------------
     # Rolling metrics
@@ -656,7 +692,12 @@ class PowerballBacktester:
             available = float(self.ticket_budget) + float(bankroll_cash)
             budget_int = int(available)
 
-            whites, reds, mults, costs, wT, rT = self._generate_tickets_for_budget(budget_int, rng=rng)
+            draw_pp = int(self._power_play_mult[i])
+            whites, reds, mults, costs, wT, rT = self._generate_tickets_for_budget(
+                budget_int,
+                rng=rng,
+                draw_power_play=draw_pp,
+            )
             actual_spend = float(costs.sum()) if costs.size > 0 else 0.0
 
             payouts = self._score_tickets(
@@ -688,7 +729,7 @@ class PowerballBacktester:
                     "date": np.array([self._draw_dates[i]] * whites.shape[0], dtype=object),
                     "cost": costs.astype(np.int64),
                     "payout": payouts.astype(np.float64),
-                    "multiplier": mults.astype(bool),
+                    "multiplier": mults.astype(np.int16),
                     "white_1": whites[:, 0].astype(np.int64),
                     "white_2": whites[:, 1].astype(np.int64),
                     "white_3": whites[:, 2].astype(np.int64),
@@ -783,7 +824,12 @@ class PowerballBacktester:
         # Generate canonical payouts once
         canonical = []
         for i in range(len(self.draws)):
-            whites, reds, mults, costs, _, _ = self._generate_tickets_for_budget(int(self.ticket_budget))
+            draw_pp = int(self._power_play_mult[i])
+            whites, reds, mults, costs, _, _ = self._generate_tickets_for_budget(
+                int(self.ticket_budget),
+                draw_power_play=draw_pp,
+                rng=rng,  # recommended for determinism in this mode
+            )
             actual_spend = float(costs.sum()) if costs.size > 0 else 0.0
 
             payouts = self._score_tickets(
@@ -925,7 +971,8 @@ class PowerballBacktester:
                     w = t["white_balls"]
                     mult_whites[j, :] = (int(w[0]), int(w[1]), int(w[2]), int(w[3]), int(w[4]))
                     mult_reds[j] = int(t["red_ball"])
-                mult_mults = np.ones((max_n_mult,), dtype=bool)
+                draw_pp = int(self._power_play_mult[i])
+                mult_mults = np.full((max_n_mult,), draw_pp, dtype=np.int16)
                 mult_payouts = self._score_tickets(
                     whites=mult_whites,
                     reds=mult_reds,
@@ -951,7 +998,7 @@ class PowerballBacktester:
                     w = t["white_balls"]
                     no_whites[j, :] = (int(w[0]), int(w[1]), int(w[2]), int(w[3]), int(w[4]))
                     no_reds[j] = int(t["red_ball"])
-                no_mults = np.zeros((max_n_no,), dtype=bool)
+                no_mults = np.ones((max_n_no,), dtype=np.int16)  
                 no_payouts = self._score_tickets(
                     whites=no_whites,
                     reds=no_reds,

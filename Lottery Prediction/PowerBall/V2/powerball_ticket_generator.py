@@ -1,6 +1,6 @@
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union, Literal
 
 import numpy as np
 import pandas as pd
@@ -57,38 +57,22 @@ class TemperatureLotteryGenerator:
     """
     Temperature-controlled generator for Powerball white and red balls.
 
-    Conceptual model
-    ----------------
-    The generator starts from empirical ball-frequency distributions derived from `csv_path`.
-    It then uses "temperature" as a dial between:
+    Legacy behavior (default):
+      alpha = clip(T / max_T, 0, 1)
+      T sampled uniformly from [T_min, max_T] when T_white/T_red are None
 
-      - Low temperature => distribution close to empirical frequencies (more mass on common numbers)
-      - High temperature => flatter distribution (closer to uniform / "true random")
+    New opt-in behavior (recommended for your intent):
+      alpha = clip(T / temperature_scale, 0, 1)   # temperature_scale is fixed (e.g., 200.0)
+      T sampled from a configurable distribution over [T_min, max_T]
+        - "rev_log1p" heavily favors high T (mostly random) with a small tail near 0 (frequency-based)
 
-    In this implementation, we map temperature to a mixture coefficient:
-
-        alpha = clip(T / max_T, 0, 1)
-        p(T) = (1 - alpha) * p_empirical + alpha * p_uniform
-
-    Therefore:
-      - T = 0         => empirical
-      - T = max_T     => uniform
-      - Larger max_T  => more "resolution" in the dial (same T produces smaller alpha)
-
-    Parameters
-    ----------
-    csv_path:
-        Path to draw-history CSV used to estimate empirical frequencies.
-        Expected columns:
-          - 'white_balls' pipe-delimited 5 ints (e.g., "3|14|27|45|62")
-          - 'red_ball' int
-    T_white_min / T_red_min:
-        Minimum temperatures used when sampling per-ticket temperatures.
-        For each ticket, T is sampled uniformly from [T_min, max_T] (clipped to max_T).
-        If you want fixed temperatures, pass T_white and/or T_red into generate_ticket_batch().
-    smoothing:
-        Laplace smoothing added to ball counts to avoid zero probability for unseen numbers.
+    Key features added:
+      - supports max_T == 0 (forces T=0, i.e., empirical distribution)
+      - temperature_scale (fixed mapping from T->alpha so max_T acts like a cap, not a rescaling)
+      - temperature_sampling mode: "uniform" (legacy), "log1p" (skew low), "rev_log1p" (skew high)
     """
+
+    TemperatureSampling = Literal["uniform", "log1p", "rev_log1p"]
 
     def __init__(
         self,
@@ -97,6 +81,8 @@ class TemperatureLotteryGenerator:
         T_white_min: float = 35.0,
         T_red_min: float = 20.0,
         smoothing: float = 1.0,
+        temperature_scale: Optional[float] = None,
+        temperature_sampling: TemperatureSampling = "uniform",
     ) -> None:
         df = pd.read_csv(csv_path)
 
@@ -107,22 +93,25 @@ class TemperatureLotteryGenerator:
         white = df["white_balls"].astype(str).str.split("|", expand=True).astype(int)
         white_vals = np.arange(1, 70, dtype=np.int64)
         w_counts = np.zeros_like(white_vals, dtype=np.float64)
-        # count occurrences
+
         flat_white = white.values.reshape(-1)
         for v in flat_white:
-            if 1 <= int(v) <= 69:
-                w_counts[int(v) - 1] += 1.0
+            iv = int(v)
+            if 1 <= iv <= 69:
+                w_counts[iv - 1] += 1.0
 
-        # Laplace smoothing
         w_counts += float(smoothing)
         w_probs = w_counts / w_counts.sum()
 
         # ----- Red balls (1..26) -----
         red_vals = np.arange(1, 27, dtype=np.int64)
         r_counts = np.zeros_like(red_vals, dtype=np.float64)
+
         for v in df["red_ball"].astype(int).values:
-            if 1 <= int(v) <= 26:
-                r_counts[int(v) - 1] += 1.0
+            iv = int(v)
+            if 1 <= iv <= 26:
+                r_counts[iv - 1] += 1.0
+
         r_counts += float(smoothing)
         r_probs = r_counts / r_counts.sum()
 
@@ -134,24 +123,9 @@ class TemperatureLotteryGenerator:
         self.T_white_min = float(T_white_min)
         self.T_red_min = float(T_red_min)
 
-    @staticmethod
-    def _mix_probs(empirical: np.ndarray, *, T: float, max_T: float) -> np.ndarray:
-        if max_T <= 0:
-            raise ValueError("max_T must be > 0")
-        alpha = float(T) / float(max_T)
-        if alpha < 0:
-            alpha = 0.0
-        elif alpha > 1:
-            alpha = 1.0
-        u = np.full_like(empirical, 1.0 / empirical.size, dtype=np.float64)
-        p = (1.0 - alpha) * empirical + alpha * u
-        # numerical guard
-        p = np.maximum(p, 0.0)
-        s = p.sum()
-        if not np.isfinite(s) or s <= 0:
-            # fallback to uniform
-            return u
-        return p / s
+        # If set, alpha = T / temperature_scale (clipped). If None, legacy alpha = T / max_T.
+        self.temperature_scale = None if temperature_scale is None else float(temperature_scale)
+        self.temperature_sampling: TemperatureLotteryGenerator.TemperatureSampling = temperature_sampling
 
     @staticmethod
     def _rng_from(rng: Optional[np.random.Generator], seed: Optional[int]) -> np.random.Generator:
@@ -159,13 +133,91 @@ class TemperatureLotteryGenerator:
             return rng
         return np.random.default_rng(seed)
 
+    @staticmethod
+    def _alpha(*, T: float, max_T: float, temperature_scale: Optional[float]) -> float:
+        """
+        Map temperature to mixture coefficient alpha in [0,1].
+        - If temperature_scale is None => legacy alpha = T/max_T
+        - Else alpha = T/temperature_scale
+        For scale<=0 we define alpha=0 (pure empirical).
+        """
+        scale = float(max_T) if temperature_scale is None else float(temperature_scale)
+        if scale <= 0.0:
+            return 0.0
+        a = float(T) / scale
+        if a < 0.0:
+            return 0.0
+        if a > 1.0:
+            return 1.0
+        return a
+
+    @staticmethod
+    def _mix_probs(
+        empirical: np.ndarray,
+        *,
+        T: float,
+        max_T: float,
+        temperature_scale: Optional[float],
+    ) -> np.ndarray:
+        # For max_T==0 (or scale==0), alpha=0 => empirical.
+        alpha = TemperatureLotteryGenerator._alpha(T=T, max_T=max_T, temperature_scale=temperature_scale)
+        u = np.full_like(empirical, 1.0 / empirical.size, dtype=np.float64)
+        p = (1.0 - alpha) * empirical + alpha * u
+
+        # numerical guard
+        p = np.maximum(p, 0.0)
+        s = p.sum()
+        if not np.isfinite(s) or s <= 0:
+            return u
+        return p / s
+
+    @staticmethod
+    def _sample_T(
+        rng: np.random.Generator,
+        *,
+        low: float,
+        high: float,
+        mode: "TemperatureLotteryGenerator.TemperatureSampling",
+    ) -> float:
+        """
+        Sample T in [low, high].
+          - uniform:   Uniform(low, high)
+          - log1p:     skew toward low (defined at 0)
+          - rev_log1p: skew toward high (mostly high T, a few low T)
+
+        Note: "log1p"/"rev_log1p" are stable at 0 and do not require log(0).
+        """
+        low = float(low)
+        high = float(high)
+
+        if high <= 0.0:
+            return 0.0
+        if low > high:
+            low = high
+        if low == high:
+            return low
+
+        span = high - low
+        u = float(rng.uniform(0.0, 1.0))
+
+        if mode == "uniform":
+            return float(low + u * span)
+
+        z = float(np.expm1(u * np.log1p(span)))  # z in [0, span], skewed to 0
+        if mode == "log1p":
+            return float(low + z)
+        if mode == "rev_log1p":
+            return float(high - z)
+
+        raise ValueError(f"Unknown temperature_sampling mode: {mode!r}")
+
     def generate_ticket_batch(
         self,
         n: int,
         *,
         max_T: float = 100.0,
         include_metadata: bool = True,
-        # Optional overrides (if None, sample uniformly from [T_min, max_T])
+        # Optional overrides (if None, sample from [T_min, max_T] according to temperature_sampling)
         T_white: Optional[float] = None,
         T_red: Optional[float] = None,
         # Uniqueness controls
@@ -189,12 +241,8 @@ class TemperatureLotteryGenerator:
 
         Notes on uniqueness
         -------------------
-        If ensure_unique=True, this function guarantees that returned tickets are unique with respect
-        to (sorted whites, red). If `existing_tickets` is provided, uniqueness is enforced against
-        that set as well.
-
-        The function resamples only as many tickets as needed to reach `n` unique tickets. It does
-        not attempt to "refund budget" because this API is count-based (n tickets).
+        If ensure_unique=True, returned tickets are unique w.r.t. (sorted whites, red).
+        If `existing_tickets` is provided, uniqueness is enforced against that set as well.
         """
         n = int(n)
         if n < 0:
@@ -203,8 +251,8 @@ class TemperatureLotteryGenerator:
             return []
 
         max_T = float(max_T)
-        if max_T <= 0:
-            raise ValueError("max_T must be > 0")
+        if max_T < 0:
+            raise ValueError("max_T must be >= 0")
 
         rng_ = self._rng_from(rng, seed)
 
@@ -217,18 +265,49 @@ class TemperatureLotteryGenerator:
         out: List[Dict[str, Any]] = []
         rounds = 0
 
-        # Helper: sample one ticket (with temps), return canonical + payload
         def _sample_one() -> Tuple[Ticket, Dict[str, Any]]:
-            # Sample per-ticket temperatures, unless explicitly provided
-            Tw = float(T_white) if T_white is not None else float(rng_.uniform(self.T_white_min, max_T))
-            Tr = float(T_red) if T_red is not None else float(rng_.uniform(self.T_red_min, max_T))
+            # Temperatures: support max_T == 0 => force T=0 (pure empirical)
+            if max_T == 0.0:
+                Tw = 0.0
+                Tr = 0.0
+            else:
+                Tw = (
+                    float(T_white)
+                    if T_white is not None
+                    else self._sample_T(
+                        rng_,
+                        low=min(self.T_white_min, max_T),
+                        high=max_T,
+                        mode=self.temperature_sampling,
+                    )
+                )
+                Tr = (
+                    float(T_red)
+                    if T_red is not None
+                    else self._sample_T(
+                        rng_,
+                        low=min(self.T_red_min, max_T),
+                        high=max_T,
+                        mode=self.temperature_sampling,
+                    )
+                )
 
             # Clip to [0, max_T]
-            Tw = max(0.0, min(Tw, max_T))
-            Tr = max(0.0, min(Tr, max_T))
+            Tw = max(0.0, min(float(Tw), max_T))
+            Tr = max(0.0, min(float(Tr), max_T))
 
-            p_w = self._mix_probs(self._white_empirical, T=Tw, max_T=max_T)
-            p_r = self._mix_probs(self._red_empirical, T=Tr, max_T=max_T)
+            p_w = self._mix_probs(
+                self._white_empirical,
+                T=Tw,
+                max_T=max_T,
+                temperature_scale=self.temperature_scale,
+            )
+            p_r = self._mix_probs(
+                self._red_empirical,
+                T=Tr,
+                max_T=max_T,
+                temperature_scale=self.temperature_scale,
+            )
 
             whites = rng_.choice(self.white_vals, size=5, replace=False, p=p_w).astype(int)
             whites.sort()
@@ -272,8 +351,7 @@ class TemperatureLotteryGenerator:
 
             remaining = n - len(out)
 
-            # Oversample a bit to reduce the number of rounds at modest n.
-            # Keep bounded to avoid large spikes in memory/time for huge n.
+            # Oversample to reduce rounds; keep bounded.
             k = int(min(max(remaining, 1) * 2, max(remaining, 1) + 5000))
 
             for _ in range(k):
@@ -287,3 +365,4 @@ class TemperatureLotteryGenerator:
                 out.append(payload)
 
         return out
+
