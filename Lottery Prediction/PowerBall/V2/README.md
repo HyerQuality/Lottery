@@ -6,8 +6,8 @@ The codebase is intentionally small and modular:
 
 - `powerball_ticket_generator.py` — generates candidate tickets (temperature-controlled sampling, uniqueness enforcement, CSV-friendly export).
 - `powerball_backtester.py` — replays generated tickets across historical draws, scores payouts, tracks cash/equity over time, and produces diagnostics + plots.
-- `powerball.csv` — historical draw data.
-- `jackpots.csv` — advertised jackpot history + winner counts.
+- `powerball.csv` — historical draw data. Sources: https://github.com/jbaranski/jeffs-lottery-utils/blob/main/numbers/powerball.csv | https://catalog.data.gov/dataset/lottery-powerball-winning-numbers-beginning-2010
+- `jackpots.csv` — advertised jackpot history + winner counts. Source: https://www.powerball.net/jackpots
 
 ---
 
