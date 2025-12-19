@@ -199,6 +199,69 @@ class PowerballMLTicketGenerator:
         p_red = self._ensemble_proba(self.red_ensemble_, X_next, n_classes=26, class_min=1)
         return p_whites, p_red
 
+    # -----------------------------
+    # Public helper API (for adapters/policies/backtesting)
+    # -----------------------------
+    def features_for_next_draw(self, df_hist: pd.DataFrame) -> pd.Series:
+        """Public wrapper: build the feature row for the next draw from historical draws."""
+        return self._features_for_next_draw(df_hist)
+
+    def ensemble_proba(
+        self,
+        ensemble: Sequence[Any],
+        X_row: pd.DataFrame,
+        *,
+        n_classes: int,
+        class_min: int,
+    ) -> np.ndarray:
+        """Public wrapper: ensemble-averaged class probability with full class alignment."""
+        return self._ensemble_proba(ensemble, X_row, n_classes=n_classes, class_min=class_min)
+
+    def apply_temperature(self, p: np.ndarray, temperature: float) -> np.ndarray:
+        """Public wrapper: apply sampling temperature to a probability vector."""
+        return self._apply_temperature(p, temperature)
+
+    def sample_whites_from_head_probas(
+        self,
+        p_whites_by_head: Dict[str, np.ndarray],
+        *,
+        temperature: float = 1.0,
+        rng: Optional[np.random.Generator] = None,
+        randomize_head_order: bool = True,
+    ) -> List[int]:
+        """Sample 5 unique white balls from per-head probability vectors over 1..69.
+
+        Uses sequential sampling without replacement (mask + renormalize) and optional temperature.
+        """
+        rng = rng or np.random.default_rng(self.seed)
+
+        heads = list(p_whites_by_head.keys())
+        if randomize_head_order:
+            rng.shuffle(heads)
+        else:
+            heads = sorted(heads)
+
+        chosen: List[int] = []
+        chosen_set = set()
+
+        for h in heads:
+            p = np.asarray(p_whites_by_head[h], dtype=np.float64).copy()
+            if p.shape[0] != 69:
+                raise ValueError(f"Expected 69-class white distribution for {h}, got shape {p.shape}")
+
+            # mask already-chosen whites (index is ball-1)
+            for w in chosen_set:
+                p[w - 1] = 0.0
+
+            p = self._renorm(p)
+            p = self.apply_temperature(p, temperature)
+            w = int(rng.choice(np.arange(1, 70), p=p))
+            chosen.append(w)
+            chosen_set.add(w)
+
+        chosen.sort()
+        return chosen
+
     def generate_tickets(
         self,
         n: int,
@@ -791,6 +854,7 @@ class PowerballMLTicketGenerator:
             refit=True,
             random_state=int(random_state),
             n_jobs=4,
+            verbose=2
         )
         search.fit(X, y)
         return search.best_estimator_

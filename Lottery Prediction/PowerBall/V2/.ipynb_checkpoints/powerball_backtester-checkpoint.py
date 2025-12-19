@@ -162,8 +162,14 @@ def _score_kernel_numpy(
     mask = (white_matches == 4) & red_matches
     payouts[mask] = PRIZE_4_WHITE_RED * m[mask]
 
+    mask = (white_matches == 4) & (~red_matches)
+    payouts[mask] = PRIZE_4_WHITE * m[mask]
+
     mask = (white_matches == 3) & red_matches
     payouts[mask] = PRIZE_3_WHITE_RED * m[mask]
+
+    mask = (white_matches == 3) & (~red_matches)
+    payouts[mask] = PRIZE_3_WHITE * m[mask]
 
     mask = (white_matches == 2) & red_matches
     payouts[mask] = PRIZE_2_WHITE_RED * m[mask]
@@ -672,6 +678,31 @@ class PowerballBacktester:
         df["rolling_sharpe"] = sharpe.where(roll_std > 0)
         return df
 
+    def _compute_withdrawal_growth(self, dates: pd.Series) -> np.ndarray:
+        """
+        Per-draw compounding multipliers for the withdrawal account using actual time deltas.
+        Returns growth array with growth[0] = 1.0, and for i>0:
+            growth[i] = (1 + withdrawal_apy) ** delta_years[i]
+        Falls back to draws_per_year if dates are missing/unparseable.
+        """
+        dates = pd.to_datetime(dates, errors="coerce")
+        n = int(len(dates))
+        growth = np.ones(n, dtype=np.float64)
+        if n <= 1:
+            return growth
+    
+        if dates.isna().any():
+            # fallback: constant cadence
+            r_draw = (1.0 + float(self.withdrawal_apy)) ** (1.0 / float(self.draws_per_year))
+            growth[:] = r_draw
+            growth[0] = 1.0
+            return growth
+    
+        delta_days = np.diff(dates.values).astype("timedelta64[D]").astype(np.float64)
+        delta_years = np.maximum(delta_days / 365.25, 0.0)
+        growth[1:] = (1.0 + float(self.withdrawal_apy)) ** delta_years
+        return growth
+
     def _replay_single(self, *, rng: Optional[np.random.Generator]) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, float]]:
         """
         Single-run replay using the configured reinvest_percent.
@@ -683,7 +714,27 @@ class PowerballBacktester:
           - buy as many tickets as possible with floor(available)
           - carry any unspent remainder in bankroll_cash
         """
-        r_draw = (1.0 + self.withdrawal_apy) ** (1.0 / self.draws_per_year)
+        # Grow the withdrawal account by the *actual* time delta between draws.
+        # This avoids assuming a fixed draws_per_year (Powerball cadence changed over time).
+        dates = pd.to_datetime(self._draw_dates)
+
+        growth = np.ones(len(self.draws), dtype=np.float64)
+        try:
+            if len(dates) > 1 and not pd.isna(dates).any():
+                delta_days = np.diff(dates).astype("timedelta64[D]").astype(np.float64)
+                delta_years = np.maximum(delta_days / 365.25, 0.0)
+                growth[1:] = (1.0 + float(self.withdrawal_apy)) ** delta_years
+            else:
+                # Fallback: assume constant draw cadence
+                r_draw = (1.0 + float(self.withdrawal_apy)) ** (1.0 / float(self.draws_per_year))
+                growth[:] = r_draw
+                growth[0] = 1.0
+        except Exception:
+            # Very defensive fallback
+            r_draw = (1.0 + float(self.withdrawal_apy)) ** (1.0 / float(self.draws_per_year))
+            growth[:] = r_draw
+            growth[0] = 1.0
+
 
         withdrawn_balance = 0.0
         bankroll_cash = 0.0
@@ -719,7 +770,7 @@ class PowerballBacktester:
             reinvested = float(draw_payout * self.reinvest_percent)
             withdrawn = float(draw_payout - reinvested)
 
-            withdrawn_balance = withdrawn_balance * r_draw + withdrawn
+            withdrawn_balance = withdrawn_balance * float(growth[i]) + withdrawn
 
             # Update bankroll cash:
             # - leftover from (available - actual_spend)
@@ -857,6 +908,7 @@ class PowerballBacktester:
         canonical_df["contributed"] = self.ticket_budget * (np.arange(len(canonical_df)) + 1)
 
         outputs: Dict[float, Dict[str, Any]] = {}
+        growth = self._compute_withdrawal_growth(canonical_df["date"])
 
         for rate in reinvest_rates:
             withdrawn_balance = 0.0
@@ -871,7 +923,7 @@ class PowerballBacktester:
                 reinvested = float(draw_payout * float(rate))
                 withdrawn = float(draw_payout - reinvested)
 
-                withdrawn_balance = withdrawn_balance * r_draw + withdrawn
+                withdrawn_balance = withdrawn_balance * float(growth[j]) + withdrawn
                 bankroll_cash = bankroll_cash + reinvested  # not spent in fixed-exposure mode
 
                 equity = withdrawn_balance + bankroll_cash
@@ -928,7 +980,7 @@ class PowerballBacktester:
         This is the mode to use if you want “reinvest => buy more tickets” and you still want
         comparisons that respect shared randomness.
         """
-        r_draw = (1.0 + self.withdrawal_apy) ** (1.0 / self.draws_per_year)
+        growth = self._compute_withdrawal_growth(self._draw_dates)
 
         # Per-rate state
         state = {
@@ -1030,7 +1082,7 @@ class PowerballBacktester:
                 reinvested = float(draw_payout * r)
                 withdrawn = float(draw_payout - reinvested)
 
-                withdrawn_balance = float(state[r]["withdrawn_balance"]) * r_draw + withdrawn
+                withdrawn_balance = float(state[r]["withdrawn_balance"]) * float(growth[i]) + withdrawn
                 bankroll_cash = (available - actual_spend) + reinvested
 
                 equity = withdrawn_balance + bankroll_cash

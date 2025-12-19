@@ -74,7 +74,7 @@ class MLBacktesterGenerator:
 
     Key behavior:
     - Advances one draw per outer cycle (existing_tickets is None for the first call in a draw).
-    - Uses history up to i-1 to predict for draw i via ml.predict_distribution_for_draw_index(i).
+    - Uses history up to i-1 to predict for draw i via features_for_next_draw(...).
     - Enforces uniqueness across multiplier/non-multiplier pools using existing_tickets.
     - Uses only the top-M ensemble members per head (M set at init).
     """
@@ -93,8 +93,8 @@ class MLBacktesterGenerator:
             ens = self._trim(self.ml.red_ensemble_)
         else:
             ens = self._trim(self.ml.white_ensembles_[head])
-        # use ml private helper for correct class alignment
-        return self.ml._ensemble_proba(ens, X_row, n_classes=n_classes, class_min=class_min)  # noqa: SLF001
+        # Public wrapper (keeps correct class alignment)
+        return self.ml.ensemble_proba(ens, X_row, n_classes=n_classes, class_min=class_min)
 
     def generate_ticket_batch(
         self,
@@ -119,9 +119,9 @@ class MLBacktesterGenerator:
             pW = {f"W{k}": np.ones(69) / 69.0 for k in range(1, 6)}
             pR = np.ones(26) / 26.0
         else:
-            # Build X row for draw i using history up to i-1 (ml provides this helper publicly)
+            # Build X row for draw i using history up to i-1
             df_hist = self.ml.draws.iloc[:i].copy()
-            X_row = self.ml._features_for_next_draw(df_hist).to_frame().T  # noqa: SLF001
+            X_row = self.ml.features_for_next_draw(df_hist).to_frame().T
 
             pW = {f"W{k}": self._ensemble_proba_trimmed(f"W{k}", X_row, n_classes=69, class_min=1) for k in range(1, 6)}
             pR = self._ensemble_proba_trimmed("R", X_row, n_classes=26, class_min=1)
@@ -141,9 +141,8 @@ class MLBacktesterGenerator:
             if attempts > 200_000:
                 raise RuntimeError("Unable to sample enough unique tickets for this draw.")
 
-            # Sample whites Option B using ml's logic (private helper; OK for now)
-            whites = self.ml._sample_whites_optionB(p_whites_by_head=pW, temperature=self.temperature, rng=rng)  # noqa: SLF001
-            red = int(rng.choice(np.arange(1, 27), p=self.ml._apply_temperature(pR.copy(), self.temperature)))  # noqa: SLF001
+            whites = self.ml.sample_whites_from_head_probas(pW, temperature=self.temperature, rng=rng)
+            red = int(rng.choice(np.arange(1, 27), p=self.ml.apply_temperature(pR.copy(), self.temperature)))
 
             key = (*whites, red)
             if ensure_unique and key in seen:
