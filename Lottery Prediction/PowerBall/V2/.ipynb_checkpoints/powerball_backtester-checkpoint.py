@@ -1079,7 +1079,7 @@ class PowerballBacktester:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def run(self, seed: Optional[int] = None) -> Dict[str, Any]:
+    def run(self, seed: Optional[int] = None) -> pd.DataFrame:
         """Run a single strategy path using the compounding exposure model.
 
         If seed is None, uses self.seed. Otherwise uses provided seed for this run only.
@@ -1088,6 +1088,9 @@ class PowerballBacktester:
         ---------------------------
         The ticket generator currently relies on NumPy's global RNG (`np.random.*`).
         This method temporarily sets the global RNG seed and restores the prior state on exit.
+
+        Returns: per-draw pd.DataFrame (equity, spend, draw_payout, net_profit, etc.)
+        Side effects: sets self.pnl_table, self.last_ticket_detail, self.last_summary, self.last_seed_used
         """
         seed_to_use = self.seed if seed is None else int(seed)
 
@@ -1235,7 +1238,7 @@ class PowerballBacktester:
             draw_detail = draw_detail.get("draw_detail") or draw_detail.get("pnl_table")
         
         if draw_detail is None or draw_detail.empty:
-            raise ValueError("draw_detail is empty; run backtest first and pass out['draw_detail'].")
+            raise ValueError("draw_detail is empty; run backtest first and pass the DataFrame returned by run().")
 
         dd = draw_detail.copy()
         x = pd.to_datetime(dd["date"])
