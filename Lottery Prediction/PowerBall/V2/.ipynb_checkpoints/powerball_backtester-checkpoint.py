@@ -16,7 +16,9 @@ from powerball_ticket_generator import TemperatureLotteryGenerator
 # Multiplier (Power Play) is applied to non-jackpot prizes as implemented here.
 PRIZE_5_WHITE = 1_000_000.0
 PRIZE_4_WHITE_RED = 50_000.0
+PRIZE_4_WHITE = 100.0
 PRIZE_3_WHITE_RED = 100.0
+PRIZE_3_WHITE = 7.0
 PRIZE_2_WHITE_RED = 7.0
 PRIZE_1_WHITE_RED = 4.0
 PRIZE_RED_ONLY = 4.0
@@ -81,8 +83,12 @@ def _payout_from_counts(
         return PRIZE_5_WHITE * m
     if white_matches == 4 and red_match == 1:
         return PRIZE_4_WHITE_RED * m
+    if white_matches == 4 and red_match == 0:
+        return PRIZE_4_WHITE * m
     if white_matches == 3 and red_match == 1:
         return PRIZE_3_WHITE_RED * m
+    if white_matches == 3 and red_match == 0:
+        return PRIZE_3_WHITE * m
     if white_matches == 2 and red_match == 1:
         return PRIZE_2_WHITE_RED * m
     if white_matches == 1 and red_match == 1:
