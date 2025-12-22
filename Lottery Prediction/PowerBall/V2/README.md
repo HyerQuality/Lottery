@@ -2,6 +2,11 @@
 
 ## Preface
 
+> **AI Co-Author:** ChatGPT (OpenAI) — *GPT-5.2 Thinking*  
+> **Role:** Architecture, refactoring strategy, statistical framing, backtesting design review, documentation, and editorial synthesis.
+>
+> This repository is a study of randomness, but also a record of what happens when you treat an LLM like an engineering partner: design debates, refactors, backtests, failures, and iteration until the code holds.
+
 This project began as a statistical investigation into whether the Powerball lottery—specifically the white balls and the red Powerball—contains any exploitable structure beyond what pure randomness would produce.
 
 Over the course of this analysis, we rigorously evaluated common intuitions and folklore about lottery “patterns” using formal statistical tests, simulations, and information-theoretic tools. The key findings are:
