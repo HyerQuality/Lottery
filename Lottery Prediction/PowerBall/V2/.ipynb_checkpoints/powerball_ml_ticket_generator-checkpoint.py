@@ -70,6 +70,7 @@ class PowerballMLTicketGenerator:
         enable_tuning: bool = True,
         tuning_n_iter: int = 30,
         tuning_cv_splits: int = 5,
+        n_jobs: int = 4,
         mc_ensemble_size: int = 7,
         mc_strategy: str = "repeated_random_search",  # or "parameter_sampler"
         param_distributions: Optional[Dict[str, Any]] = None,
@@ -87,10 +88,13 @@ class PowerballMLTicketGenerator:
         self.enable_tuning = bool(enable_tuning)
         self.tuning_n_iter = int(tuning_n_iter)
         self.tuning_cv_splits = int(tuning_cv_splits)
+        self.n_jobs = int(n_jobs)
         self.mc_ensemble_size = int(mc_ensemble_size)
         self.mc_strategy = str(mc_strategy)
         self.seed = int(seed)
         self.verbose = bool(verbose)
+
+        self._validate_config()
 
         self.draws_raw = self._load(draw_data)
         self.draws = self._canonicalize_and_parse(self.draws_raw)
@@ -104,6 +108,13 @@ class PowerballMLTicketGenerator:
             l2_regularization=0.0,
             max_bins=255,
             random_state=self.seed,
+
+            # Anti-overfit defaults
+            early_stopping=False,
+            validation_fraction=0.25,
+            n_iter_no_change=20,
+            tol=1e-7,
+            max_iter=500,
         )
 
         self.param_distributions = param_distributions or self._default_param_distributions()
@@ -122,6 +133,68 @@ class PowerballMLTicketGenerator:
     # -----------------------------
     # Public API
     # -----------------------------
+    def _validate_config(self) -> None:
+        """Validate construction-time configuration.
+
+        Kept intentionally lightweight to avoid altering behavior, while failing fast on
+        clearly invalid split fractions.
+        """
+        if self.val_size < 0.0 or self.test_size < 0.0 or (self.val_size + self.test_size) >= 1.0:
+            raise ValueError(
+                f"Invalid val/test sizes: val_size={self.val_size}, test_size={self.test_size}. "
+                "Require val_size>=0, test_size>=0, and val_size+test_size<1."
+            )
+
+    # -----------------------------
+    # Determinism + parsing helpers
+    # -----------------------------
+    @staticmethod
+    def _stable_head_offset(head_name: str) -> int:
+        """Deterministic integer offset for per-head RNG seeding.
+
+        Avoids Python's randomized hash(), ensuring reproducible ensembles across processes.
+        """
+        digest = hashlib.sha256(str(head_name).encode("utf-8")).digest()
+        # 32-bit offset is sufficient and stable
+        return int.from_bytes(digest[:4], "little", signed=False)
+
+    @staticmethod
+    def _parse_whites(series: pd.Series) -> pd.DataFrame:
+        """Parse a column of white-ball strings into a (n,5) int DataFrame.
+
+        Accepts common delimiters ("|", ",", spaces) by extracting digit groups.
+        Raises ValueError with context if any row fails to yield 5 valid balls.
+        """
+        found = series.astype(str).str.findall(r"\d+")
+        rows = []
+        bad_idx = []
+        for i, vals in enumerate(found.tolist()):
+            nums = [int(v) for v in vals][:5]
+            if len(nums) != 5:
+                bad_idx.append(i)
+                rows.append([np.nan] * 5)
+                continue
+            rows.append(nums)
+
+        whites = pd.DataFrame(rows, columns=[f"white_{k}" for k in range(1, 6)])
+
+        if bad_idx:
+            examples = series.iloc[bad_idx[:5]].astype(str).tolist()
+            raise ValueError(
+                f"Failed to parse 5 white balls from {len(bad_idx)} row(s). "
+                f"Examples: {examples}"
+            )
+
+        arr = whites.to_numpy(dtype=int)
+
+        # Basic validation: range and uniqueness per draw
+        if (arr < 1).any() or (arr > 69).any():
+            raise ValueError("White balls must be integers in [1, 69].")
+        if any(len(set(row)) != 5 for row in arr):
+            raise ValueError("White balls must be unique within each draw.")
+
+        return whites.astype(int)
+
     def build(self) -> "PowerballMLTicketGenerator":
         X, yW, yR = self._make_supervised_frame(self.draws)
         self.splits_ = self._split_chronological(X, yW, yR)
@@ -136,8 +209,10 @@ class PowerballMLTicketGenerator:
         if self.splits_ is None or self.preprocessor_ is None:
             self.build()
 
-        assert self.splits_ is not None
-        assert self.preprocessor_ is not None
+        if self.splits_ is None:
+            raise RuntimeError("Internal error: splits_ is not initialized. Call build() first.")
+        if self.preprocessor_ is None:
+            raise RuntimeError("Internal error: preprocessor_ is not initialized. Call build() first.")
 
         # --- build augmented training data for white heads
         XW_train, yW_heads_train = self._augment_whites(
@@ -290,26 +365,14 @@ class PowerballMLTicketGenerator:
             attempts += 1
             if attempts > 100_000:
                 raise RuntimeError("Unable to sample enough unique tickets; relax uniqueness or adjust temperature.")
+            chosen_whites = self.sample_whites_from_head_probas(
+                p_whites_by_head,
+                temperature=temperature,
+                rng=rng,
+                randomize_head_order=True,
+            )
 
-            # head-order randomization
-            heads = [f"W{i}" for i in range(1, 6)]
-            rng.shuffle(heads)
-
-            chosen_whites: List[int] = []
-            chosen_set = set()
-
-            for h in heads:
-                p = p_whites_by_head[h].copy()  # over 1..69
-                # mask chosen
-                for w in chosen_set:
-                    p[w - 1] = 0.0
-                p = self._renorm(p)
-                p = self._apply_temperature(p, temperature)
-                w = int(rng.choice(np.arange(1, 70), p=p))
-                chosen_whites.append(w)
-                chosen_set.add(w)
-
-            chosen_whites.sort()
+            # sample_whites_from_head_probas returns sorted whites
             red = int(rng.choice(np.arange(1, 27), p=self._apply_temperature(p_red.copy(), temperature)))
 
             key = (*chosen_whites, red)
@@ -532,7 +595,7 @@ class PowerballMLTicketGenerator:
         out["date"] = pd.to_datetime(out["date"], errors="coerce")
         out = out.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
 
-        whites = out["white_balls"].astype(str).str.split("|", expand=True).iloc[:, :5].astype(int)
+        whites = self._parse_whites(out["white_balls"])
         whites.columns = [f"white_{i}" for i in range(1, 6)]
 
         out = pd.concat([out[["date", "red_ball"]], whites], axis=1)
@@ -683,7 +746,8 @@ class PowerballMLTicketGenerator:
         )
 
     def _get_split(self, split: str) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray]:
-        assert self.splits_ is not None
+        if self.splits_ is None:
+            raise RuntimeError("Internal error: splits_ is not initialized. Call build() first.")
         s = split.lower().strip()
         if s == "train":
             return self.splits_.X_train, self.splits_.yW_train, self.splits_.yR_train
@@ -757,7 +821,8 @@ class PowerballMLTicketGenerator:
         )
 
     def _make_pipeline(self, *, random_state: int) -> Pipeline:
-        assert self.preprocessor_ is not None
+        if self.preprocessor_ is None:
+            raise RuntimeError("Internal error: preprocessor_ is not initialized. Call build() first.")
         mdl = clone(self.base_model)
         if hasattr(mdl, "random_state"):
             setattr(mdl, "random_state", int(random_state))
@@ -797,7 +862,7 @@ class PowerballMLTicketGenerator:
           - CV happens only on training via TimeSeriesSplit.
         """
         M = max(1, int(self.mc_ensemble_size))
-        rng = np.random.default_rng(self.seed + (hash(head_name) % 10_000))
+        rng = np.random.default_rng(self.seed + self._stable_head_offset(head_name))
 
         if not self.enable_tuning:
             return [self._fit_one(X_train, y_train, random_state=int(rng.integers(1, 1_000_000))) for _ in range(M)]
@@ -853,7 +918,7 @@ class PowerballMLTicketGenerator:
             cv=cv,
             refit=True,
             random_state=int(random_state),
-            n_jobs=4,
+            n_jobs=self.n_jobs,
             verbose=2
         )
         search.fit(X, y)

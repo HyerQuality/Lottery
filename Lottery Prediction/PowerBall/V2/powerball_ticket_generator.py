@@ -30,25 +30,87 @@ class Ticket:
     def as_tuple(self) -> Tuple[int, int, int, int, int, int]:
         return (self.w1, self.w2, self.w3, self.w4, self.w5, self.red)
 
+
+
+    @staticmethod
+    def _from_parts(whites: Sequence[int], red: int) -> "Ticket":
+        """
+        Construct a Ticket from raw parts with validation and canonicalization.
+
+        - Whites are sorted into ascending order.
+        - Validation enforces exactly 5 unique whites in [1, 69] and red in [1, 26].
+        """
+        if len(whites) != 5:
+            raise ValueError(f"Ticket must have exactly 5 white balls; got {len(whites)}")
+
+        try:
+            whites_i = [int(w) for w in whites]
+            red_i = int(red)
+        except Exception as e:
+            raise ValueError(f"Ticket parts must be integers: whites={whites!r}, red={red!r}") from e
+
+        if any(w < 1 or w > 69 for w in whites_i):
+            raise ValueError(f"White balls must be in [1, 69]; got {whites_i!r}")
+        if len(set(whites_i)) != 5:
+            raise ValueError(f"White balls must be unique; got {whites_i!r}")
+        if red_i < 1 or red_i > 26:
+            raise ValueError(f"Red ball must be in [1, 26]; got {red_i!r}")
+
+        whites_sorted = sorted(whites_i)
+        return Ticket(whites_sorted[0], whites_sorted[1], whites_sorted[2], whites_sorted[3], whites_sorted[4], red_i)
     @staticmethod
     def from_any(x: TicketLike) -> "Ticket":
+        """
+        Normalize a ticket into the canonical internal representation used for uniqueness checks.
+
+        Accepted inputs
+        ---------------
+        - Tuple[int,int,int,int,int,int]: (w1,w2,w3,w4,w5,red) (whites may be unsorted)
+        - Dict with nested schema: {"white_balls": [...5...], "red_ball": r}
+        - Dict with flat schema:   {"white_1":..,"white_5":..,"red_ball": r}
+
+        Validation
+        ----------
+        - Whites: exactly 5 integers, unique, each in [1, 69]
+        - Red: integer in [1, 26]
+
+        Raises
+        ------
+        ValueError
+            If the input cannot be parsed or violates invariants.
+        TypeError
+            If the input type is unsupported.
+        """
+        if isinstance(x, Ticket):
+            return x
+
+        whites: List[int]
+        red: int
+
         if isinstance(x, tuple) and len(x) == 6:
             w1, w2, w3, w4, w5, red = map(int, x)
-            whites = sorted((w1, w2, w3, w4, w5))
-            return Ticket(*whites, int(red))
+            whites = [w1, w2, w3, w4, w5]
+            return Ticket._from_parts(whites, red)
 
         if isinstance(x, dict):
+            # nested schema: {"white_balls":[...], "red_ball":...}
             if "white_balls" in x and "red_ball" in x:
                 whites = list(map(int, x["white_balls"]))
-                if len(whites) != 5:
-                    raise ValueError("ticket dict white_balls must have length 5")
-                whites = sorted(whites)
-                return Ticket(*whites, int(x["red_ball"]))
+                red = int(x["red_ball"])
+                return Ticket._from_parts(whites, red)
 
             # flat schema: white_1..white_5, red_ball
-            if all(k in x for k in ("white_1", "white_2", "white_3", "white_4", "white_5", "red_ball")):
-                whites = sorted([int(x["white_1"]), int(x["white_2"]), int(x["white_3"]), int(x["white_4"]), int(x["white_5"])])
-                return Ticket(*whites, int(x["red_ball"]))
+            flat_keys = ("white_1", "white_2", "white_3", "white_4", "white_5", "red_ball")
+            if all(k in x for k in flat_keys):
+                whites = [int(x["white_1"]), int(x["white_2"]), int(x["white_3"]), int(x["white_4"]), int(x["white_5"])]
+                red = int(x["red_ball"])
+                return Ticket._from_parts(whites, red)
+
+            raise ValueError(
+                "Unsupported ticket dict schema. Expected either "
+                "{'white_balls': [...], 'red_ball': ...} or flat keys "
+                "white_1..white_5 plus 'red_ball'."
+            )
 
         raise TypeError("Unsupported ticket representation for uniqueness checks.")
 
@@ -76,15 +138,19 @@ class TemperatureLotteryGenerator:
 
     def __init__(
         self,
-        csv_path: str,
+        csv_path: str = "powerball.csv",
         *,
+        df: Optional[pd.DataFrame] = None,
         T_white_min: float = 35.0,
         T_red_min: float = 20.0,
         smoothing: float = 1.0,
         temperature_scale: Optional[float] = None,
         temperature_sampling: TemperatureSampling = "uniform",
     ) -> None:
-        df = pd.read_csv(csv_path)
+        if df is None:
+            df = pd.read_csv(csv_path)
+        else:
+            df = df.copy()
 
         if "white_balls" not in df.columns or "red_ball" not in df.columns:
             raise ValueError("csv_path must contain columns: 'white_balls' and 'red_ball'")
@@ -241,8 +307,16 @@ class TemperatureLotteryGenerator:
 
         Notes on uniqueness
         -------------------
-        If ensure_unique=True, returned tickets are unique w.r.t. (sorted whites, red).
+        If ensure_unique=True, returned tickets are unique with respect to (sorted whites, red).
         If `existing_tickets` is provided, uniqueness is enforced against that set as well.
+
+        If uniqueness cannot be satisfied within `max_rounds`, this method raises RuntimeError.
+        (It does not silently return fewer than `n` tickets.)
+
+        RNG precedence
+        --------------
+        If `rng` is provided, it is used directly and `seed` is ignored.
+        Otherwise, a new numpy Generator is created from `seed` (or from the instance seed).
         """
         n = int(n)
         if n < 0:

@@ -1,13 +1,15 @@
 import secrets
 import inspect
 from contextlib import contextmanager
-from typing import Any, Dict, Iterable, Optional, Tuple, Sequence
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, Optional, Tuple, Sequence, Protocol, runtime_checkable, TYPE_CHECKING, Literal
 
 import numpy as np
 import pandas as pd
 import re
 
-from powerball_ticket_generator import TemperatureLotteryGenerator
+if TYPE_CHECKING:
+    from powerball_ticket_generator import TemperatureLotteryGenerator  # noqa: F401
 
 # -------------------------------------------------
 # Prize constants (single source of truth)
@@ -184,6 +186,44 @@ def _score_kernel_numpy(
 
 
 
+# -------------------------------------------------
+# Public interfaces (typing-only, no runtime coupling)
+# -------------------------------------------------
+@runtime_checkable
+class TicketGenerator(Protocol):
+    """Protocol for ticket generators consumed by PowerballBacktester.
+
+    Generators are expected to provide a ``generate_ticket_batch`` method that returns an
+    iterable of dict-like ticket records. The backtester adapts to optional keyword
+    arguments via signature inspection (rng, seed, ensure_unique, existing_tickets).
+
+    Required keys per ticket when include_metadata=True:
+      - white_balls: Sequence[int] (length 5)
+      - red_ball: int
+    Optional keys (when store_temperatures=True):
+      - white_temperature / T_white
+      - red_temperature / T_red
+
+    When include_metadata=False (legacy format), required keys:
+      - white_1 .. white_5
+      - red_ball
+    """
+
+    def generate_ticket_batch(self, **kwargs: Any) -> Any: ...
+
+
+@dataclass(frozen=True)
+class TicketBatch:
+    """Internal container for a generated batch of tickets."""
+
+    whites: np.ndarray          # (N, 5) int64
+    reds: np.ndarray            # (N,) int64
+    multipliers: np.ndarray     # (N,) int16 : 1 if no Power Play; else draw multiplier (2/3/4/5/10)
+    costs: np.ndarray           # (N,) int64 : 2 or 3
+    white_temps: Optional[np.ndarray]  # (N,) float64 or None
+    red_temps: Optional[np.ndarray]    # (N,) float64 or None
+
+
 class PowerballBacktester:
     """
     Powerball backtesting framework built around TemperatureLotteryGenerator.
@@ -217,7 +257,7 @@ class PowerballBacktester:
         self,
         draw_csv: str,
         jackpot_csv: str,
-        generator: TemperatureLotteryGenerator,
+        generator: TicketGenerator,
         ticket_budget: int,
         use_multiplier: bool = True,
         reinvest_percent: float = 0.0,
@@ -227,6 +267,7 @@ class PowerballBacktester:
         prefer_numba: bool = True,
         withdrawal_apy: float = 0.02,
         draws_per_year: int = 104,
+        jackpot_default: Literal["median", "nearest", "linear", "parabolic"] = "parabolic",
         seed: Optional[int] = None,
     ):
         self.seed = self._init_seed(seed)
@@ -293,6 +334,10 @@ class PowerballBacktester:
         if self.draws_per_year <= 0:
             raise ValueError("draws_per_year must be positive.")
 
+        self.jackpot_default = str(jackpot_default).lower()
+        if self.jackpot_default not in ("median", "nearest", "linear", "parabolic"):
+            raise ValueError("jackpot_default must be one of: median, nearest, linear, parabolic")
+
         self._use_numba = bool(prefer_numba and NUMBA_AVAILABLE)
 
         # --- Preprocess draw data for speed ---
@@ -315,6 +360,8 @@ class PowerballBacktester:
             )
         )
         self.median_jackpot = float(self.jackpots["jackpot"].median())
+        # Precompute anchor points for jackpot interpolation (used when a draw date is absent from jackpot CSV).
+        self._prepare_jackpot_anchors()
         self._jackpot_values = np.array(
             [self._jackpot_value_for_date(str(d)) for d in self._draw_dates],
             dtype=np.float64,
@@ -332,7 +379,36 @@ class PowerballBacktester:
         # Stored after run()
         self.pnl_table: Optional[pd.DataFrame] = None
 
+        self._validate_config()
+
         self._sanity_check()
+
+    # ------------------------------------------------------------------
+    # Configuration validation
+    # ------------------------------------------------------------------
+    def _validate_config(self) -> None:
+        """Validate backtester configuration invariants.
+
+        This method is intentionally conservative: it validates only invariants that should hold
+        regardless of generator implementation. It does not mutate state.
+        """
+        if self.ticket_budget < 0:
+            raise ValueError("ticket_budget must be >= 0")
+
+        if not (0.0 <= float(self.reinvest_percent) <= 1.0):
+            raise ValueError("reinvest_percent must be within [0, 1].")
+
+        if self.rolling_window <= 0:
+            raise ValueError("rolling_window must be positive.")
+
+        if self.draws_per_year <= 0:
+            raise ValueError("draws_per_year must be positive.")
+
+        if float(self.withdrawal_apy) < 0.0:
+            raise ValueError("withdrawal_apy must be >= 0")
+
+        if self.jackpot_default not in ("median", "nearest", "linear", "parabolic"):
+            raise ValueError("jackpot_default must be one of: median, nearest, linear, parabolic")
 
     # ------------------------------------------------------------------
     # Sanity check
@@ -436,6 +512,129 @@ class PowerballBacktester:
         self.seed = self._init_seed(seed)
         return self.seed
 
+    # ------------------------------------------------------------------
+    # Jackpot modeling helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _date_str_to_ordinal(date_str: str) -> Optional[int]:
+        """Parse a date-like string into a Gregorian ordinal (days since 0001-01-01).
+
+        Returns None if parsing fails.
+        """
+        dt = pd.to_datetime(date_str, errors="coerce")
+        if pd.isna(dt):
+            return None
+        # Convert via python date to avoid timezone ambiguity.
+        return dt.date().toordinal()
+
+    @staticmethod
+    def _quadratic_lagrange(x: float, x0: float, y0: float, x1: float, y1: float, x2: float, y2: float) -> float:
+        """Quadratic (parabolic) interpolation using the Lagrange form.
+
+        This is used as a *local* interpolant when jackpot_default='parabolic'. It is parameter-free
+        but may overshoot when anchor points vary sharply; results are floored at 0.
+        """
+        d0 = (x0 - x1) * (x0 - x2)
+        d1 = (x1 - x0) * (x1 - x2)
+        d2 = (x2 - x0) * (x2 - x1)
+        if d0 == 0.0 or d1 == 0.0 or d2 == 0.0:
+            # Degenerate (duplicate x values): fall back to linear behavior.
+            return float(y1)
+        l0 = (x - x1) * (x - x2) / d0
+        l1 = (x - x0) * (x - x2) / d1
+        l2 = (x - x0) * (x - x1) / d2
+        return float(y0) * l0 + float(y1) * l1 + float(y2) * l2
+
+    def _prepare_jackpot_anchors(self) -> None:
+        """Prepare sorted jackpot anchor points for interpolation.
+
+        Anchors are taken from jackpot_csv rows (date, jackpot). Duplicate dates keep the last
+        occurrence after sorting.
+        """
+        dt = pd.to_datetime(self.jackpots["date"], errors="coerce")
+        df = self.jackpots.loc[~dt.isna(), ["date", "jackpot"]].copy()
+        if df.empty:
+            self._jackpot_anchor_ord = np.array([], dtype=np.int32)
+            self._jackpot_anchor_val = np.array([], dtype=np.float64)
+            return
+
+        df["date_ord"] = pd.to_datetime(df["date"], errors="coerce").dt.date.apply(lambda d: d.toordinal())
+        df = df.sort_values("date_ord").drop_duplicates("date_ord", keep="last")
+
+        self._jackpot_anchor_ord = df["date_ord"].to_numpy(dtype=np.int32)
+        self._jackpot_anchor_val = df["jackpot"].astype(float).to_numpy(dtype=np.float64)
+
+    def _jackpot_default_value(self, draw_date: str) -> float:
+        """Return the default jackpot value for a draw date absent from the jackpot map.
+
+        Strategies:
+          - 'median':   historical median of anchor jackpots (legacy behavior).
+          - 'nearest': nearest anchor jackpot by date.
+          - 'linear':  linear interpolation between surrounding anchors.
+          - 'parabolic': local quadratic interpolation using 3 anchor points.
+
+        Notes
+        -----
+        Your jackpot CSV may only contain jackpot-winning draws. In that case, this method provides
+        a *proxy* for the jackpot on non-winning draws.
+        """
+        if self.jackpot_default == "median":
+            return float(self.median_jackpot)
+
+        if not hasattr(self, "_jackpot_anchor_ord") or self._jackpot_anchor_ord.size == 0:
+            return float(self.median_jackpot)
+
+        x = self._date_str_to_ordinal(draw_date)
+        if x is None:
+            return float(self.median_jackpot)
+
+        xs = self._jackpot_anchor_ord.astype(np.float64)
+        ys = self._jackpot_anchor_val.astype(np.float64)
+
+        if self.jackpot_default == "nearest":
+            idx = int(np.argmin(np.abs(xs - float(x))))
+            return float(ys[idx])
+
+        if self.jackpot_default == "linear":
+            # Linear interpolation is inherently bounded between the two adjacent anchors,
+            # but we clamp explicitly for safety (and to align with the parabolic policy below).
+            y = float(np.interp(float(x), xs, ys))
+            i = int(np.searchsorted(xs, float(x), side="left"))
+            if 0 < i < int(xs.shape[0]):
+                y_lo = float(min(ys[i - 1], ys[i]))
+                y_hi = float(max(ys[i - 1], ys[i]))
+                y = min(max(y, y_lo), y_hi)
+            return float(max(0.0, y))
+
+        # parabolic (local quadratic)
+        n = int(xs.shape[0])
+        if n < 3:
+            return float(np.interp(float(x), xs, ys))
+
+        # Identify the bracketing segment [k, k+1].
+        i = int(np.searchsorted(xs, float(x)))
+        if i <= 0:
+            return float(ys[0])
+        if i >= n:
+            return float(ys[-1])
+
+        k = i - 1
+        if k <= 0:
+            i0, i1, i2 = 0, 1, 2
+        elif k >= n - 2:
+            i0, i1, i2 = n - 3, n - 2, n - 1
+        else:
+            i0, i1, i2 = k - 1, k, k + 1
+
+        y = self._quadratic_lagrange(float(x), xs[i0], ys[i0], xs[i1], ys[i1], xs[i2], ys[i2])
+
+        # Clamp to the adjacent anchor jackpots to prevent quadratic overshoot.
+        y = float(max(0.0, y))
+        y_lo = float(min(ys[k], ys[k + 1]))
+        y_hi = float(max(ys[k], ys[k + 1]))
+        y = min(max(y, y_lo), y_hi)
+        return float(y)
+
     def _jackpot_value_for_date(self, draw_date: str) -> float:
         """Return the jackpot value applicable to the given draw date.
 
@@ -443,28 +642,31 @@ class PowerballBacktester:
           - jackpot: advertised jackpot amount
           - winners: number of jackpot winners reported for that draw
 
-        If winners > 0, we model *you* as an additional winner by returning:
-
-            jackpot / (winners + 1)
-
-        This prevents divide-by-zero and makes the semantics explicit: if you win on a draw
-        that already had winners, you share the jackpot.
-
-        If the date is missing from the jackpot file, or winners==0, we fall back to the
-        median jackpot across the provided jackpot history.
+        Semantics
+        ---------
+        - If the draw date exists in jackpot_csv and winners > 0, we model *you* as an additional winner:
+              payout = jackpot / (winners + 1)
+          (Jackpot is not multiplied by Power Play.)
+        - If the draw date exists and winners == 0, you are treated as the sole winner:
+              payout = jackpot
+        - If the date is missing from jackpot_csv, we return a proxy jackpot value using
+          the configured ``jackpot_default`` strategy (median/nearest/linear/parabolic).
         """
         row = self._jackpot_map.get(draw_date)
         if row is None:
-            return self.median_jackpot
+            return float(self._jackpot_default_value(draw_date))
 
         jackpot, winners = row
-        jackpot = float(jackpot)
-        winners = int(winners)
+        jackpot_f = float(jackpot)
+        try:
+            winners_i = int(winners)
+        except Exception:
+            winners_i = 0
 
-        if winners > 0:
-            return jackpot / (winners + 1)
+        if winners_i > 0:
+            return jackpot_f / (winners_i + 1)
 
-        return self.median_jackpot
+        return jackpot_f
 
     def _allocate_ticket_counts(self, budget: int) -> Tuple[int, int]:
         """
@@ -536,7 +738,7 @@ class PowerballBacktester:
         *,
         draw_power_play: int,
         rng: Optional[np.random.Generator] = None,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+    ) -> TicketBatch:
         """Generate tickets for a single draw given an integer budget.
     
         Returns:
@@ -608,7 +810,14 @@ class PowerballBacktester:
             )
             _fill(batch_no, is_mult=False, cost=2)
     
-        return whites, reds, mults, costs, white_temps, red_temps
+        return TicketBatch(
+            whites=whites,
+            reds=reds,
+            multipliers=mults,
+            costs=costs,
+            white_temps=white_temps,
+            red_temps=red_temps,
+        )
 
     def _score_tickets(
         self,
@@ -750,17 +959,17 @@ class PowerballBacktester:
             budget_int = int(available)
 
             draw_pp = int(self._power_play_mult[i])
-            whites, reds, mults, costs, wT, rT = self._generate_tickets_for_budget(
+            batch = self._generate_tickets_for_budget(
                 budget_int,
                 rng=rng,
                 draw_power_play=draw_pp,
             )
-            actual_spend = float(costs.sum()) if costs.size > 0 else 0.0
+            actual_spend = float(batch.costs.sum()) if batch.costs.size > 0 else 0.0
 
             payouts = self._score_tickets(
-                whites=whites,
-                reds=reds,
-                mults=mults,
+                whites=batch.whites,
+                reds=batch.reds,
+                mults=batch.multipliers,
                 win_whites=self._win_whites[i],
                 win_red=int(self._win_reds[i]),
                 jackpot_value=float(self._jackpot_values[i]),
@@ -781,22 +990,22 @@ class PowerballBacktester:
             net_profit = equity - cumulative_contributed
             draw_net = draw_payout - actual_spend
 
-            if whites.shape[0] > 0:
+            if batch.whites.shape[0] > 0:
                 td = {
-                    "date": np.array([self._draw_dates[i]] * whites.shape[0], dtype=object),
-                    "cost": costs.astype(np.int64),
+                    "date": np.array([self._draw_dates[i]] * batch.whites.shape[0], dtype=object),
+                    "cost": batch.costs.astype(np.int64),
                     "payout": payouts.astype(np.float64),
-                    "multiplier": mults.astype(np.int16),
-                    "white_1": whites[:, 0].astype(np.int64),
-                    "white_2": whites[:, 1].astype(np.int64),
-                    "white_3": whites[:, 2].astype(np.int64),
-                    "white_4": whites[:, 3].astype(np.int64),
-                    "white_5": whites[:, 4].astype(np.int64),
-                    "red_ball": reds.astype(np.int64),
+                    "multiplier": batch.multipliers.astype(np.int16),
+                    "white_1": batch.whites[:, 0].astype(np.int64),
+                    "white_2": batch.whites[:, 1].astype(np.int64),
+                    "white_3": batch.whites[:, 2].astype(np.int64),
+                    "white_4": batch.whites[:, 3].astype(np.int64),
+                    "white_5": batch.whites[:, 4].astype(np.int64),
+                    "red_ball": batch.reds.astype(np.int64),
                 }
                 if self.store_temperatures:
-                    td["white_temperature"] = wT.astype(np.float64)
-                    td["red_temperature"] = rT.astype(np.float64)
+                    td["white_temperature"] = batch.white_temps.astype(np.float64)  # type: ignore[union-attr]
+                    td["red_temperature"] = batch.red_temps.astype(np.float64)  # type: ignore[union-attr]
                 ticket_frames.append(pd.DataFrame(td))
 
             draw_records.append({
@@ -882,17 +1091,17 @@ class PowerballBacktester:
         canonical = []
         for i in range(len(self.draws)):
             draw_pp = int(self._power_play_mult[i])
-            whites, reds, mults, costs, _, _ = self._generate_tickets_for_budget(
+            batch = self._generate_tickets_for_budget(
                 int(self.ticket_budget),
                 draw_power_play=draw_pp,
                 rng=rng,  # recommended for determinism in this mode
             )
-            actual_spend = float(costs.sum()) if costs.size > 0 else 0.0
+            actual_spend = float(batch.costs.sum()) if batch.costs.size > 0 else 0.0
 
             payouts = self._score_tickets(
-                whites=whites,
-                reds=reds,
-                mults=mults,
+                whites=batch.whites,
+                reds=batch.reds,
+                mults=batch.multipliers,
                 win_whites=self._win_whites[i],
                 win_red=int(self._win_reds[i]),
                 jackpot_value=float(self._jackpot_values[i]),
@@ -1513,20 +1722,19 @@ def run_unit_tests() -> None:
         dtype=np.int64,
     )
     ticket_reds = np.array([10, 11, 10, 10, 10, 10, 10, 11], dtype=np.int64)
+    # Multipliers: 1 means no Power Play; otherwise the draw's Power Play multiplier (2/3/4/5/10).
+    # Jackpot is never multiplied.
+    multipliers = np.array([1, 10, 2, 1, 2, 1, 2, 1], dtype=np.int16)
 
-    # Multipliers: apply to all non-jackpot prizes; last two arbitrary
-    multipliers_bool = np.array([True, True, True, False, True, False, True, False], dtype=bool)
-    multipliers_i8 = multipliers_bool.astype(np.int8)
-
-    p_numpy = _score_kernel_numpy(ticket_whites, ticket_reds, multipliers_bool, win_whites, win_red, jackpot_value)
-    p_numba = _score_kernel_numba(ticket_whites, ticket_reds, multipliers_i8, win_whites, win_red, jackpot_value)
+    p_numpy = _score_kernel_numpy(ticket_whites, ticket_reds, multipliers, win_whites, win_red, jackpot_value)
+    p_numba = _score_kernel_numba(ticket_whites, ticket_reds, multipliers, win_whites, win_red, jackpot_value)
 
     _assert(np.allclose(p_numpy, p_numba), "NumPy and Numba kernels disagree")
 
     expected = np.array(
         [
             jackpot_value,                 # jackpot (no multiplier)
-            PRIZE_5_WHITE * 2.0,          # 5 whites with multiplier
+            PRIZE_5_WHITE * 10.0,         # 5 whites with multiplier (tests 10x)
             PRIZE_4_WHITE_RED * 2.0,      # 4+red with multiplier
             PRIZE_3_WHITE_RED * 1.0,      # 3+red no multiplier
             PRIZE_2_WHITE_RED * 2.0,      # 2+red with multiplier
