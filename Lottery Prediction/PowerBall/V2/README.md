@@ -1,383 +1,146 @@
-# Powerball Analysis — Ticket Generation + Backtesting
+# Powerball Temperature-Based Lottery Generator
 
-This repository is a research-oriented framework for:
-- generating Powerball tickets using multiple strategies (temperature-mixed and ML-based), and
-- replaying those tickets against historical draws to produce a **hypothetical** equity / P&L path.
+## Preface
 
-This project is intended for experimentation and diagnostics, not operational wagering advice.
+This project began as a statistical investigation into whether the Powerball lottery—specifically the white balls and the red Powerball—contains any exploitable structure beyond what pure randomness would produce.
 
----
+Over the course of this analysis, we rigorously evaluated common intuitions and folklore about lottery “patterns” using formal statistical tests, simulations, and information-theoretic tools. The key findings are:
 
-## Repository layout
+### White Balls (5-of-69)
+- Apparent patterns (decade clustering, parity balance, range, smooth cumulative sums) are fully explained by combinatorics and finite-sample randomness.
+- Individual white-ball frequencies are statistically uniform within binomial variance.
+- No serial dependence, momentum, or regime shifts were detected.
+- Change-point tests, conditional tests, and entropy analysis all support a high-entropy, near-ideal random process.
+- Any remaining bias, if it exists, is below the threshold required to consistently improve 4/5 or 5/5 hit rates.
 
-- `powerball_ticket_generator.py`  
-  Temperature-controlled ticket generator (`TemperatureLotteryGenerator`) and a canonical `Ticket` dataclass (used for uniqueness checks across different ticket schemas).
+### Red Ball (1-of-26)
+- The red ball alone behaves as a uniform, memoryless categorical variable.
+- Frequency, parity, modulo, recurrence (waiting times), and entropy tests all align with the theoretical ideal.
+- A weak conditional signal appeared when conditioning on extreme white-ball ranges, but this effect collapsed under stress testing and was not operationally stable.
 
-- `powerball_ml_ticket_generator.py`  
-  Tree-ensemble ML generator (`PowerballMLTicketGenerator`) that learns per-position categorical distributions from lagged/rolling features, supports hyperparameter tuning, and includes `save_state()` / `load_state()` persistence.
+### Generator Validation
+- We implemented a temperature-controlled generator and formally proved via simulation that:
+  - As temperature increases, the generator becomes statistically indistinguishable from uniform random draws.
+  - Any introduced bias is fully controlled, bounded, and removable via temperature.
+- Ablation studies confirmed that randomizing red-ball temperature adds noise without improving calibration or hit rates.
 
-- `powerball_ml_policy.py`  
-  Utilities for policy search and an adapter (`MLBacktesterGenerator`) that exposes a `generate_ticket_batch(...)` interface so ML-generated tickets can be plugged into the backtester.
-
-- `powerball_backtester.py`  
-  Backtesting engine (`PowerballBacktester`) that replays generated tickets across historical draws, applies a prize table (incl. Power Play multipliers where applicable), and tracks bankroll/equity over time.
-
-- `jackpots_scraper.py`  
-  Utility to refresh `jackpots.csv` from the Powerball.net jackpots table.
-
-- `powerball.csv`  
-  Historical draw data with columns like: `date`, `white_balls` (pipe-delimited), `red_ball`, `power_play`.
-
-- `jackpots.csv`  
-  Jackpot history with columns: `Draw Date`, `Jackpot`, `Winners` (the backtester normalizes column names internally).
+Bottom line:
+There is no hidden exploit in Powerball. What can be done honestly is to control entropy—deciding how much structure vs randomness you want—without pretending that structure implies predictive power.
 
 ---
 
-## Installation
+## Project Overview
 
-Python 3.10+ recommended.
+This repository provides a scientifically defensible Powerball ticket generator built around a single unifying concept:
 
-Core dependencies:
-- `numpy`, `pandas`
-- `matplotlib`
+Temperature controls entropy, not odds.
 
-ML generator dependencies:
-- `scikit-learn`
-- `joblib`
-- `scipy` (for `randint` / `loguniform` parameter distributions)
+The generator allows you to interpolate smoothly between:
+- Low-entropy, frequency-weighted sampling (exploitative)
+- High-entropy, uniform-random sampling (fully random)
 
-Optional (performance):
-- `numba` (faster payout scoring)
+All behavior is:
+- Statistically validated
+- Parameterized
+- Reversible
+- Explicitly bounded
 
-Optional (jackpots scraper):
-- `lxml` (used by `pandas.read_html`)
+---
 
-Example:
-```bash
-pip install numpy pandas matplotlib scikit-learn joblib scipy
-pip install numba lxml  # optional
+## Core Concepts
+
+### Temperature
+
+Borrowed from statistical mechanics and modern machine learning:
+
+- Low temperature (T → 0): deterministic, sharp distributions
+- Moderate temperature (T ≈ 1): structured randomness
+- High temperature (T ≥ 5–20): indistinguishable from uniform randomness
+
+Temperature does not change odds—it changes entropy.
+
+### Separate Entropy Channels
+
+- White balls: temperature-controlled, sampled without replacement
+- Red ball: fixed-temperature, near-uniform by default
+
+---
+
+## Code Structure
+
+### TemperatureLotteryGenerator
+
+The main class encapsulating all logic.
+
+Key features:
+- Empirical frequency extraction from historical data
+- Softmax-based temperature scaling
+- No-replacement white-ball sampling
+- Independent red-ball modeling
+- CSV-friendly output mode
+
+---
+
+## Usage Examples
+
+### Basic Ticket Generation
+```python
+gen = TemperatureLotteryGenerator("powerball.csv")
+ticket = gen.draw(T_white=1.0)
+print(ticket)
 ```
 
----
-
-## Data formats
-
-### `powerball.csv`
-Expected columns (aliases are accepted by ML generator; the backtester normalizes common aliases too):
-- `date`: draw date (string; parsed by pandas)
-- `white_balls`: five white balls as a pipe-delimited string, e.g. `"18|30|40|48|52"`
-- `red_ball`: integer 1..26
-- `power_play`: e.g. `"2X"`, `"3X"`, `"10X"` (used only when `use_multiplier=True`)
-
-### `jackpots.csv`
-Columns:
-- `Draw Date`: draw date
-- `Jackpot`: string dollars with commas/spaces, e.g. `" 564,100,000 "`
-- `Winners`: integer winner count
-
-The backtester normalizes the jackpot file into canonical columns:
-- `date`, `jackpot`, `winners`
-
-Jackpot modeling detail:
-- If a draw shows `winners > 0`, the backtester models “you as an additional winner” via: `jackpot / (winners + 1)`.
-- If the draw date is missing from `jackpots.csv`, the backtester falls back to the median jackpot in the file.
-
----
-
-## Ticket schema (`Ticket`)
-
-`powerball_ticket_generator.Ticket` is a frozen, canonical representation used for uniqueness checks.
-
-- Whites are stored sorted `(w1 < w2 < w3 < w4 < w5)`.
-- Red is stored as `red`.
-
-`Ticket.from_any(...)` accepts:
-- tuple: `(w1, w2, w3, w4, w5, red)`
-- dict with list whites: `{"white_balls":[...], "red_ball":...}`
-- dict “flat” form: `{"white_1":..., ..., "white_5":..., "red_ball":...}`
-
----
-
-## Generator 1: Temperature-controlled sampling (`TemperatureLotteryGenerator`)
-
-The temperature generator estimates empirical frequencies from `powerball.csv`, then samples from a mixture of:
-- empirical probabilities (history-weighted), and
-- uniform probabilities.
-
-### Temperature → mixing weight
-Let `p_empirical` be the empirical probability vector and `p_uniform` be uniform.
-
-The generator mixes them as:
-- `p(T) = (1 - alpha) * p_empirical + alpha * p_uniform`
-
-Where `alpha` is computed in one of two ways:
-
-**Legacy mapping (if `temperature_scale=None`):**
-- `alpha = clip(T / max_T, 0, 1)`
-
-**Fixed mapping (recommended; set `temperature_scale`, e.g. 200.0):**
-- `alpha = clip(T / temperature_scale, 0, 1)`
-- Here, `max_T` acts as a cap on sampled `T` (not a rescaling of alpha).
-
-### Temperature sampling distributions
-Controlled by `temperature_sampling`:
-- `"uniform"`: uniform over `[T_min, max_T]`
-- `"log1p"`: favors lower temperatures (more empirical)
-- `"rev_log1p"`: favors higher temperatures (more uniform), with a small tail near low temperatures
-
-### Uniqueness
-`generate_ticket_batch(...)` can enforce uniqueness:
-- within the returned batch, and
-- against an externally provided set via `existing_tickets=...` (used by the backtester to prevent duplicates across ticket pools when multiplier tickets are enabled).
-
-### Example: generate tickets (CSV/cashier-friendly)
+### Batch Generation (Research Mode)
 ```python
-import pandas as pd
-from powerball_ticket_generator import TemperatureLotteryGenerator
-
-gen = TemperatureLotteryGenerator(
-    csv_path="powerball.csv",
-    T_white_min=35.0,
-    T_red_min=20.0,
-    smoothing=1.0,
-    temperature_scale=200.0,
-    temperature_sampling="rev_log1p",
-)
-
 tickets = gen.generate_ticket_batch(
-    10,
+    n=50,
     max_T=100.0,
-    include_metadata=False,  # flat schema for easy CSV printing
-    seed=123,
+    include_metadata=True
 )
-
-df = pd.DataFrame(tickets)
-df.to_csv("tickets.csv", index=False)
-print(df.head())
 ```
 
-If `include_metadata=True`, each record includes `T_white`, `T_red`, and `max_T`.
-
----
-
-## Generator 2: ML tree-ensemble (`PowerballMLTicketGenerator`)
-
-`PowerballMLTicketGenerator` is a time-series supervised learning pipeline that:
-- engineers lagged and rolling features from historical draws,
-- fits per-position multiclass models for `W1..W5` (69 classes each) and `Red` (26 classes),
-- optionally tunes hyperparameters and builds an ensemble,
-- generates tickets by sequential sampling without replacement, with a sampling temperature (soften/sharpen).
-
-### Example: fit on a parameter space + evaluate + save state (no embedded draws)
-
+### Batch Generation (Cashier / CSV Mode)
 ```python
-import numpy as np
+tickets = gen.generate_ticket_batch(
+    n=50,
+    include_metadata=False
+)
+
 import pandas as pd
-
-from powerball_ml_ticket_generator import PowerballMLTicketGenerator
-from scipy.stats import randint, loguniform
-
-param_space = {
-    # With default max_iter (100), LR too small tends to underfit; too large can destabilize.
-    "model__learning_rate": loguniform(0.02, 0.12),
-
-    # Keep trees modest; you have ~230 engineered features and (for whites) ~9k augmented rows.
-    "model__max_leaf_nodes": randint(15, 80),        # [15..79]
-
-    # Must work for red head too (only ~903 train rows), so don’t push leaf sizes too high.
-    "model__min_samples_leaf": randint(10, 80),      # [10..79]
-
-    # Regularization: avoid huge values; log scale gives diversity without wasting samples.
-    "model__l2_regularization": loguniform(1e-4, 1.0),
-
-    # Depth: include None for “leaf-node-limited” growth; otherwise keep moderate.
-    "model__max_depth": [None, 2, 3, 4, 5, 6],
-
-    # Histogram bin count; trades training speed vs split granularity (higher = finer, slower)
-    "model__max_bins": randint(64, 256),   # [64..255]
-}
-
-ml = PowerballMLTicketGenerator(
-    draw_data="powerball.csv",
-    lag_n=15,
-    rolling_windows=(5, 10, 20),
-    augment_permutations=10,
-    use_quantile=False,                 # OFF for boosting
-    enable_tuning=True,
-    mc_ensemble_size=9,                 # must be >= max ensemble_size you want to test later
-    mc_strategy="repeated_random_search",
-    tuning_n_iter=15,
-    tuning_cv_splits=5,                 # TimeSeriesSplit on train only
-    param_distributions=param_space,
-    seed=123,
-    verbose=True,
-).fit()
-
-print(ml.evaluate(split="val"))
-
-# Save without embedding draws (smaller artifact).
-ml.save_state("boosted_trees_powerball.joblib", include_draws=False)
-```
-
-### Example: load state and generate tickets
-If you saved with `include_draws=False`, you must provide draws when loading:
-
-```python
-from powerball_ml_ticket_generator import PowerballMLTicketGenerator
-
-ml2 = PowerballMLTicketGenerator.load_state(
-    "boosted_trees_powerball.joblib",
-    draw_data="powerball.csv",
-)
-
-tickets = ml2.generate_tickets(n=20, temperature=1.0, as_flat=True)
-print(tickets[0])
+pd.DataFrame(tickets).to_csv("tickets.csv", index=False)
 ```
 
 ---
 
-## Backtesting (`PowerballBacktester`)
+## Recommended Defaults
 
-The backtester replays a generator’s tickets across historical draws and produces per-draw accounting.
-
-### Core accounting model
-Per draw:
-- You contribute `ticket_budget` dollars (no “ruin” rule).
-- Winnings are split:
-  - `reinvested = payout * reinvest_percent`
-  - `withdrawn  = payout - reinvested`
-- `withdrawn` goes into an external account compounding at `withdrawal_apy` (per draw, using `draws_per_year`).
-- `reinvested` remains as “bankroll cash” used to buy additional tickets in later draws (when `reinvest_percent > 0`).
-
-Wealth definitions:
-- `contributed_t = ticket_budget * t`
-- `equity_t = withdrawn_balance_t + bankroll_cash_t`
-- `net_profit_t = equity_t - contributed_t`
-
-### Ticket pricing + multiplier modeling
-If `use_multiplier=True`, two ticket types are modeled:
-- Base ticket cost: $2
-- “Multiplier” (Power Play) ticket cost: $3
-
-Multiplier application:
-- The backtester parses the draw’s `power_play` (e.g. `"3X"`, `"10X"`) into an integer multiplier.
-- The multiplier is applied to **non-jackpot prizes only** for tickets that purchased Power Play.
-- Jackpot prizes are never multiplied.
-
-### Prize table
-The backtester includes explicit constants for the prize tiers it models and applies them via the scoring kernel.
-
-> Note: The project is designed so the prize tiers are defined once (constants) and used consistently by the scoring kernel.
-
-### Example: backtest the temperature generator
-```python
-from powerball_ticket_generator import TemperatureLotteryGenerator
-from powerball_backtester import PowerballBacktester
-
-gen = TemperatureLotteryGenerator(
-    csv_path="powerball.csv",
-    temperature_scale=200.0,
-    temperature_sampling="rev_log1p",
-)
-
-bt = PowerballBacktester(
-    draw_csv="powerball.csv",
-    jackpot_csv="jackpots.csv",
-    generator=gen,
-    ticket_budget=100,       # dollars contributed each draw
-    use_multiplier=True,
-    reinvest_percent=0.0,
-    max_T=100.0,             # passed through to generate_ticket_batch(...)
-    store_temperatures=True, # include T metadata in per-ticket detail
-    seed=123,
-)
-
-draw_detail = bt.run()               # returns per-draw pd.DataFrame
-ticket_detail = bt.last_ticket_detail
-summary = bt.last_summary
-
-bt.plot_winnings(draw_detail)
-```
-
-### Example: compare reinvestment policies fairly
-`compare_reinvest_rates(...)` returns a MultiIndex DataFrame indexed by `(reinvest_rate, date)`.
-
-Modes:
-- `fixed_exposure`: same tickets purchased per draw for all rates (isolates accounting effects)
-- `nested_compounding`: reinvestment buys more tickets, but uses shared nested ticket pools per draw so “higher spend includes lower spend tickets” for fairness
-
-```python
-cmp = bt.compare_reinvest_rates(
-    reinvest_rates=(0.0, 0.25, 0.5, 1.0),
-    mode="nested_compounding",
-    plot=True,
-)
-print(cmp.groupby(level=0)[["final_equity", "net_profit_final", "roi"]].tail(1))
-```
-
-### Example: analyze temperature stratification
-If you ran with `store_temperatures=True`, you can stratify outcomes by temperature deciles:
-
-```python
-temp_summary = bt.summarize_by_white_temperature_deciles(bt.last_ticket_detail, q=10)
-print(temp_summary)
-```
+| Parameter | Recommended | Rationale |
+|---------|------------|-----------|
+| T_white | 1.0 | Best balance of structure vs randomness |
+| max_T | 50–100 | Safely saturates uniform regime |
+| T_red | 20 | Proven indistinguishable from uniform |
+| Multiplier | Optional | Affects payouts only, not odds |
 
 ---
 
-## Using ML tickets inside the backtester
+## What This Project Is (and Is Not)
 
-The backtester expects a generator that exposes:
-```python
-generate_ticket_batch(n: int, *, max_T: float, include_metadata: bool, existing_tickets=..., ...)
-```
+### This project is:
+- A rigorous statistical exploration
+- A transparent entropy-control tool
+- A defensible lottery generator
+- A demonstration of applied probability, simulation, and inference
 
-`powerball_ml_policy.MLBacktesterGenerator` adapts a fitted `PowerballMLTicketGenerator` to that interface.
-
-### Example: backtest ML-generated tickets (via adapter)
-
-```python
-from powerball_backtester import PowerballBacktester
-from powerball_ml_policy import MLBacktesterGenerator
-from powerball_ml_ticket_generator import PowerballMLTicketGenerator
-
-ml = PowerballMLTicketGenerator(draw_data="powerball.csv", enable_tuning=False, mc_ensemble_size=7, seed=123).fit()
-
-gen = MLBacktesterGenerator(
-    ml,
-    temperature=1.0,    # ML sampling temperature
-    ensemble_size=5,    # use top-M ensemble members per head
-    seed=123,
-)
-
-bt = PowerballBacktester(
-    draw_csv="powerball.csv",
-    jackpot_csv="jackpots.csv",
-    generator=gen,
-    ticket_budget=100,
-    use_multiplier=True,
-    reinvest_percent=0.0,
-    seed=123,
-)
-
-draw_detail = bt.run()
-bt.plot_winnings(draw_detail)
-```
+### This project is not:
+- A system that beats the lottery
+- A predictor of winning numbers
+- A belief in hidden conspiracies
 
 ---
 
-## Refreshing `jackpots.csv`
-```python
-from jackpots_scraper import Jackpots
+## Final Note
 
-df = Jackpots(since="2015-01-01").run()
-df.to_csv("jackpots.csv", index=False)
-```
+This repository exists to demonstrate how to reason correctly about randomness, bias, and uncertainty—even when the answer is “there is no edge.”
 
----
-
-## Known issues / sharp edges
-
-- **Prize tiers vs NumPy fallback:** if `numba` is not installed (so the NumPy scoring kernel is used), verify that all modeled tiers are implemented in the NumPy path. The Numba path uses `_payout_from_counts(...)` (single source of truth). If you notice missing tiers when running without Numba, either install `numba` or update `_score_kernel_numpy(...)` to mirror `_payout_from_counts(...)`.
-
-- **ML adapter uses private helpers:** `MLBacktesterGenerator` calls some private methods on `PowerballMLTicketGenerator` for correct class alignment and white-ball sampling. This is pragmatic but can be refactored into a public API if you want stricter encapsulation.
+If you’re going to play, play honestly.
+If you’re going to model, model rigorously.
