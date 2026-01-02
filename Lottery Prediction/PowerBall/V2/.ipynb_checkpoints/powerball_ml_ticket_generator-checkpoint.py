@@ -111,7 +111,7 @@ class PowerballMLTicketGenerator:
 
             # Anti-overfit defaults
             early_stopping=False,
-            validation_fraction=0.25,
+            validation_fraction=0.50,
             n_iter_no_change=20,
             tol=1e-7,
             max_iter=500,
@@ -876,7 +876,9 @@ class PowerballMLTicketGenerator:
         if self.mc_strategy == "repeated_random_search":
             for m in range(M):
                 rs = int(rng.integers(1, 1_000_000))
-                best = self._fit_via_random_search(X_train, y_train, random_state=rs)
+                best = self._fit_via_random_search(
+                    X_train, y_train, random_state=rs, n_classes=n_classes, class_min=class_min
+                )
                 candidates.append(best)
         else:
             # parameter sampler: sample M hyperparam sets and fit directly
@@ -906,20 +908,25 @@ class PowerballMLTicketGenerator:
         pipe.fit(X, y)
         return pipe
 
-    def _fit_via_random_search(self, X: pd.DataFrame, y: np.ndarray, *, random_state: int) -> Pipeline:
+    def _fit_via_random_search(self, X, y, *, random_state: int, n_classes: int, class_min: int) -> Pipeline:
         pipe = self._make_pipeline(random_state=random_state)
-
+    
+        def neg_log_loss_fixed(estimator, X_fold, y_fold):
+            p = self._proba_fixed(estimator, X_fold, n_classes=n_classes, class_min=class_min)
+            return -self._log_loss_fixed(y_fold.astype(int), p, n_classes=n_classes, class_min=class_min)
+    
         cv = TimeSeriesSplit(n_splits=max(2, int(self.tuning_cv_splits)))
         search = RandomizedSearchCV(
             estimator=pipe,
             param_distributions=self.param_distributions,
             n_iter=max(1, int(self.tuning_n_iter)),
-            scoring="neg_log_loss",
+            scoring=neg_log_loss_fixed,   # <- avoids missing classes errors by assigning epsilon prob to missing classes
             cv=cv,
             refit=True,
             random_state=int(random_state),
             n_jobs=self.n_jobs,
-            verbose=2
+            verbose=2,
+            error_score="raise",          # optional while verifying
         )
         search.fit(X, y)
         return search.best_estimator_
